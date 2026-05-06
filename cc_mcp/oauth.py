@@ -12,6 +12,7 @@ import base64
 import hashlib
 import http.server
 import json
+import os
 import re
 import secrets
 import threading
@@ -23,7 +24,6 @@ from typing import Optional
 
 TOKEN_STORE = Path.home() / ".cheetahclaws" / "mcp_oauth_tokens.json"
 REDIRECT_PORT = 54321
-REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}/callback"
 
 
 def _http():
@@ -48,6 +48,7 @@ def _load_tokens() -> dict:
 def _save_tokens(data: dict) -> None:
     TOKEN_STORE.parent.mkdir(parents=True, exist_ok=True)
     TOKEN_STORE.write_text(json.dumps(data, indent=2))
+    os.chmod(TOKEN_STORE, 0o600)
 
 
 def get_cached_token(server_url: str) -> Optional[str]:
@@ -137,11 +138,11 @@ def _discover_endpoints(www_auth_header: str) -> tuple[str, str]:
 
 # ── Dynamic client registration ───────────────────────────────────────────────
 
-def _register_client(registration_endpoint: str) -> str:
+def _register_client(registration_endpoint: str, redirect_uri: str) -> str:
     httpx = _http()
     resp = httpx.post(registration_endpoint, json={
         "client_name": "cheetahclaws",
-        "redirect_uris": [REDIRECT_URI],
+        "redirect_uris": [redirect_uri],
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
         "token_endpoint_auth_method": "none",
@@ -150,7 +151,7 @@ def _register_client(registration_endpoint: str) -> str:
     return resp.json()["client_id"]
 
 
-def _get_or_register_client(server_url: str, token_uri: str) -> str:
+def _get_or_register_client(server_url: str, token_uri: str, redirect_uri: str) -> str:
     data = _load_tokens()
     reg_key = f"__client__{server_url}"
     if reg_key in data:
@@ -159,7 +160,7 @@ def _get_or_register_client(server_url: str, token_uri: str) -> str:
     base = token_uri.rsplit("/token", 1)[0]
     registration_endpoint = f"{base}/register"
     try:
-        client_id = _register_client(registration_endpoint)
+        client_id = _register_client(registration_endpoint, redirect_uri)
     except Exception as e:
         raise RuntimeError(
             f"Dynamic client registration failed for {server_url}: {e}\n"
@@ -187,10 +188,17 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
     code: Optional[str] = None
     error: Optional[str] = None
     done = threading.Event()
+    expected_state: str = ""
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         params = dict(urllib.parse.parse_qsl(parsed.query))
+        if params.get("state") != _CallbackHandler.expected_state:
+            self.send_response(400)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<h2>Invalid state parameter. Possible CSRF.</h2>")
+            return
         if "code" in params:
             _CallbackHandler.code = params["code"]
         else:
@@ -205,14 +213,19 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def _run_callback_server() -> http.server.HTTPServer:
+def _run_callback_server() -> tuple[http.server.HTTPServer, int]:
     _CallbackHandler.code = None
     _CallbackHandler.error = None
     _CallbackHandler.done.clear()
-    server = http.server.HTTPServer(("localhost", REDIRECT_PORT), _CallbackHandler)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-    return server
+    for port in range(54321, 54332):
+        try:
+            server = http.server.HTTPServer(("localhost", port), _CallbackHandler)
+            t = threading.Thread(target=server.serve_forever, daemon=True)
+            t.start()
+            return server, port
+        except OSError:
+            continue
+    raise RuntimeError("No available port in range 54321-54331 for OAuth callback")
 
 
 # ── Main OAuth flow ───────────────────────────────────────────────────────────
@@ -226,21 +239,25 @@ def acquire_token(server_url: str, www_auth_header: str) -> str:
             "Set an Authorization header manually in mcp.json."
         )
 
-    client_id = _get_or_register_client(server_url, token_uri)
     verifier, challenge = _pkce_pair()
     state = secrets.token_urlsafe(16)
+    _CallbackHandler.expected_state = state
+
+    callback_server, redirect_port = _run_callback_server()
+    redirect_uri = f"http://localhost:{redirect_port}/callback"
+
+    client_id = _get_or_register_client(server_url, token_uri, redirect_uri)
 
     auth_url = auth_uri + "?" + urllib.parse.urlencode({
         "response_type": "code",
         "client_id": client_id,
-        "redirect_uri": REDIRECT_URI,
+        "redirect_uri": redirect_uri,
         "scope": "mcp",
         "state": state,
         "code_challenge": challenge,
         "code_challenge_method": "S256",
     })
 
-    callback_server = _run_callback_server()
     print(f"\n[MCP OAuth] Opening browser for {server_url} ...")
     print(f"[MCP OAuth] If the browser doesn't open, visit:\n  {auth_url}\n")
     webbrowser.open(auth_url)
@@ -257,7 +274,7 @@ def acquire_token(server_url: str, www_auth_header: str) -> str:
     resp = httpx.post(token_uri, data={
         "grant_type": "authorization_code",
         "code": _CallbackHandler.code,
-        "redirect_uri": REDIRECT_URI,
+        "redirect_uri": redirect_uri,
         "client_id": client_id,
         "code_verifier": verifier,
     }, timeout=15)
