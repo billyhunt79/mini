@@ -845,8 +845,25 @@ def cmd_mcp(args: str, _state, config) -> bool:
         return True
 
     if subcmd == "add":
+        # HTTP transport: /mcp add <name> --transport http <url>
+        if "--transport" in parts:
+            ti = parts.index("--transport")
+            if ti + 2 >= len(parts):
+                err("Usage: /mcp add <name> --transport http <url>")
+                return True
+            transport_type = parts[ti + 1].lower()
+            if transport_type not in ("http", "sse"):
+                err(f"Unsupported transport '{transport_type}'. Use: http, sse")
+                return True
+            name = parts[1]
+            url = parts[ti + 2]
+            add_server_to_user_config(name, {"type": transport_type, "url": url})
+            ok(f"Added MCP server '{name}' ({transport_type}: {url}) → /mcp reload to connect")
+            return True
+        # Stdio transport: /mcp add <name> <command> [args...]
         if len(parts) < 3:
-            err("Usage: /mcp add <name> <command> [arg1 arg2 ...]")
+            err("Usage: /mcp add <name> <command> [arg1 arg2 ...]\n"
+                "       /mcp add <name> --transport http <url>")
             return True
         name = parts[1]
         command = parts[2]
@@ -855,7 +872,7 @@ def cmd_mcp(args: str, _state, config) -> bool:
         if cmd_args:
             raw["args"] = cmd_args
         add_server_to_user_config(name, raw)
-        ok(f"Added MCP server '{name}' → restart or /mcp reload to connect")
+        ok(f"Added MCP server '{name}' → /mcp reload to connect")
         return True
 
     if subcmd == "remove":

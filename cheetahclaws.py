@@ -43,7 +43,8 @@ Slash commands in REPL:
   /agents           Show sub-agent tasks
   /mcp              List MCP servers and their tools
   /mcp reload       Reconnect all MCP servers
-  /mcp add <n> <cmd> [args]  Add a stdio MCP server
+  /mcp add <n> <cmd> [args]              Add a stdio MCP server
+  /mcp add <n> --transport http <url>    Add an HTTP/SSE MCP server
   /mcp remove <n>   Remove an MCP server from config
   /plugin           List installed plugins
   /plugin install name@url   Install a plugin
