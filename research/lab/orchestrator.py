@@ -321,29 +321,123 @@ def _stage_questioning(run: LabRun) -> None:
 
 
 def _stage_survey(run: LabRun) -> None:
-    """Surveyor maps related work + identifies gaps."""
+    """Surveyor maps related work + identifies gaps.
+
+    Now grounded in real search hits from `research.aggregator.research`
+    rather than pure model-memory hallucination. The surveyor LLM is
+    given top-N titles + abstracts as context, and must base its
+    "## Related work" + "## Citations" sections on those — fabricated
+    citations get caught later by the verifier, but priming with real
+    data dramatically lowers their rate.
+
+    On any failure (no API keys, all sources rate-limited, etc.) we
+    fall back to the old prompt-only path so a fresh laptop without
+    Tavily/Brave/etc. can still get some output.
+    """
     s = run.state
     run.storage.start_stage(s.run_id, Stage.SURVEY.value, 0)
     rq = s.research_questions[0] if s.research_questions else s.topic
-    user_prompt = (
-        f"Topic: {run.state.topic}\n"
-        f"Selected research question: {rq}\n\n"
-        "Survey the relevant literature you know about (or have seen via"
-        " /research). Produce:\n"
-        "  ## Related work\n"
-        "    A 2-3 paragraph synthesis of major prior threads, with"
-        " inline citations like [Author, Year].\n"
-        "  ## Identified gap\n"
-        "    The specific gap our work intends to fill, in 2-3 sentences.\n"
-        "  ## Citations\n"
-        "    A bullet list: `- Title (Authors, Year). Optional arXiv:NNNN.`\n"
-        "Output Markdown."
-    )
+
+    search_block = _gather_search_context(run, rq)
+
+    if search_block:
+        # Persist search results so /lab logs has them and reviewer
+        # iterations can replay against the same evidence.
+        run.storage.put_artifact(s.run_id, "survey_search_hits", search_block)
+
+    if search_block:
+        user_prompt = (
+            f"Topic: {run.state.topic}\n"
+            f"Selected research question: {rq}\n\n"
+            "Real search results (use these as the primary source — do "
+            "NOT cite anything not listed below unless you can name a "
+            "specific paper from training data with high confidence):\n\n"
+            f"{search_block}\n\n"
+            "Produce:\n"
+            "  ## Related work\n"
+            "    A 2-3 paragraph synthesis of major prior threads, with"
+            " inline citations like [Author, Year]. Cite the real hits"
+            " above; group similar ones together.\n"
+            "  ## Identified gap\n"
+            "    The specific gap our work intends to fill, in 2-3 sentences.\n"
+            "    Be concrete — a gap is a question the literature above"
+            " has not answered, not just a sentence about needing more"
+            " research.\n"
+            "  ## Citations\n"
+            "    Bullet list of every reference you used, format:\n"
+            "    `- Title (Authors, Year). Optional arXiv:NNNN.`\n"
+            "Output Markdown."
+        )
+    else:
+        # Fallback to the original prompt — no search hits available.
+        user_prompt = (
+            f"Topic: {run.state.topic}\n"
+            f"Selected research question: {rq}\n\n"
+            "Survey the relevant literature you know about. Produce:\n"
+            "  ## Related work\n"
+            "    A 2-3 paragraph synthesis of major prior threads, with"
+            " inline citations like [Author, Year].\n"
+            "  ## Identified gap\n"
+            "    The specific gap our work intends to fill, in 2-3 sentences.\n"
+            "  ## Citations\n"
+            "    A bullet list: `- Title (Authors, Year). Optional arXiv:NNNN.`\n"
+            "Output Markdown."
+        )
+
     resp = _invoke(run, run.roles.surveyor, user=user_prompt, kind="draft")
     s.survey_summary = resp.text
     run.storage.put_artifact(s.run_id, "survey", s.survey_summary)
     s.citations_raw = _extract_citations_block(s.survey_summary)
     run.storage.end_stage(s.run_id, Stage.SURVEY.value, 0, outcome="advance")
+
+
+def _gather_search_context(run: LabRun, rq: str, *,
+                           per_source_limit: int = 8,
+                           max_total: int = 30,
+                           max_chars: int = 8000) -> str:
+    """Run /research's aggregator on the topic + RQ, format as context.
+
+    Returns "" if the aggregator fails wholesale (network down, no
+    sources available, etc.) so the surveyor falls back gracefully.
+    Best-effort: a partial result is still better than no grounding.
+    """
+    try:
+        from research.aggregator import research as _research
+        # Bias toward academic + tech, the buckets that matter for survey.
+        # We deliberately don't pass --sources so the classifier can pick
+        # the strongest available ones (arxiv / openalex / semantic_scholar
+        # / huggingface_papers / google_scholar).
+        brief = _research(
+            topic=f"{run.state.topic} :: {rq}",
+            domains=["academic", "tech"],
+            limit=per_source_limit,
+            use_cache=True,
+            synthesize=False,        # we don't want the model brief here
+            max_total_results=max_total,
+            config=run.config,
+        )
+    except Exception:
+        return ""
+
+    if not brief or not getattr(brief, "results", None):
+        return ""
+
+    # Format hits compactly. Each hit ≈ 250 chars; cap on total chars.
+    parts: list[str] = []
+    used = 0
+    for i, r in enumerate(brief.results, 1):
+        title = (getattr(r, "title", "") or "").strip().replace("\n", " ")
+        url = (getattr(r, "url", "") or "").strip()
+        snippet = (getattr(r, "snippet", "") or "").strip().replace("\n", " ")
+        src = (getattr(r, "source", "") or "").strip()
+        snippet = snippet[:300]
+        line = f"[{i}] ({src}) {title}\n    {url}\n    {snippet}".rstrip()
+        if used + len(line) > max_chars:
+            parts.append(f"… ({len(brief.results) - i + 1} more hits omitted for length)")
+            break
+        parts.append(line)
+        used += len(line) + 1
+    return "\n".join(parts)
 
 
 def _stage_outline(run: LabRun) -> None:
