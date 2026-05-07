@@ -86,6 +86,11 @@ def load_config() -> dict:
     # Also accept ANTHROPIC_API_KEY env for backward-compat
     if not cfg.get("anthropic_api_key"):
         cfg["anthropic_api_key"] = os.environ.get("ANTHROPIC_API_KEY", "")
+    # Env var always wins over persisted value so .env changes take effect immediately
+    if os.environ.get("ANTHROPIC_ENDPOINT"):
+        cfg["anthropic_endpoint"] = os.environ["ANTHROPIC_ENDPOINT"]
+    elif not cfg.get("anthropic_endpoint"):
+        cfg["anthropic_endpoint"] = "https://api.anthropic.com"
     return cfg
 
 
