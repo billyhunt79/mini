@@ -416,6 +416,95 @@ A previous run's reports stay in `~/.cheetahclaws/research_papers/`.
 then halts; it does **not** kill mid-stage. Use `/lab abort <run_id>`
 for that.
 
+### Output paths (v3.05.78+)
+
+Reports save to a **human-readable directory** instead of the cryptic
+`lab_<hex>/` form:
+
+```
+~/.cheetahclaws/research_papers/
+   2026-05-08_14-30_post-transformer-architectures-comparative_b16036de/
+       report.md
+       references.bib
+       citations_verified.json
+   2026-05-08_15-12_neural-architecture-search-for-tabular_a1b2c3d4/
+       report.md
+       ...
+```
+
+Format: `<YYYY-MM-DD>_<HH-MM>_<topic-slug>_<run_id_short>` — chronological
+sort by `ls`, slug at-a-glance, run-id short suffix guarantees uniqueness
+across two runs with the same topic + minute.
+
+**Migrating legacy reports.** Existing `lab_xxx/` directories from earlier
+runs aren't auto-renamed (safer to ask). Use:
+
+```
+/lab migrate-paths               # dry-run preview
+/lab migrate-paths --apply       # actually rename
+```
+
+Idempotent, never overwrites an existing target, lists unknown legacy
+dirs (no matching DB row — usually old test runs) separately and skips
+them.
+
+### Inspecting model assignment
+
+```
+/lab models
+```
+
+prints all 11 roles (PI, questioner, surveyor, designer, engineer,
+analyst, writer, reviewer × 3, lay_reader) with their resolved model +
+which API key drove the choice + ● for explicit overrides via
+`lab_role_override`. **Critical**: the meta-loop (`/lab iterate`) needs
+**heterogeneous reviewers** to produce signal — three reviewers from
+the same model family rubber-stamp each other and convergence becomes
+meaningless. `/lab models` warns when reviewers span fewer than 3
+distinct families:
+
+```
+Warning:  Reviewers span only 1 model family; homogeneous review
+          reduces meta-loop signal. Set more API keys (Anthropic /
+          OpenAI / Gemini / DeepSeek / Qwen) for diversity.
+```
+
+### Surveyor grounding (v3.05.78+)
+
+Before invoking the surveyor LLM, the orchestrator now runs
+`research.aggregator.research()` against `topic + selected_RQ`
+(academic + tech buckets, top 30 hits, no model-synthesis). Results are
+formatted as `[N] (source) Title / URL / snippet` blocks (≤8KB) and
+passed as context. The surveyor prompt instructs it to cite from this
+list rather than memory — **fabricated-citation rate drops sharply**
+on tested topics.
+
+Search hits are persisted as a `survey_search_hits` artifact for
+audit + replay determinism. If the aggregator fails wholesale (no
+Tavily / Brave / etc. key, all sources 429, network down) the surveyor
+logs a diagnostic note and falls back to the original prompt-only
+path (so the run still completes, just unguided).
+
+To get real grounding, set at least one web-search key:
+```
+/config tavily_api_key=tvly-...     # https://tavily.com (free 1000/mo)
+/config brave_api_key=BSA...        # https://api.search.brave.com (free 2000/mo)
+```
+
+### Verifier hard timeout (v3.05.78+)
+
+The citation verifier used to occasionally hang for 11+ minutes when
+arxiv / Semantic Scholar returned a slow-loris socket (urllib's socket
+timeout doesn't fire on byte-trickle servers). Now:
+
+* Per-citation hard wall-clock cap (default 30s) via
+  `concurrent.futures.ThreadPoolExecutor` + `future.result(timeout)` —
+  unkillable urlopen() is interrupted at the Python level.
+* Stage-level cap (default 5 min) — citations not yet processed get
+  marked `verification_skipped` so finalization still produces a report.
+* Progress callback writes `[3/12] verified` etc. to the run log,
+  visible via `/lab logs <run_id>`.
+
 ### Realistic expectations
 
 Phase A makes the *workflow* autonomous: no human babysitting, results
