@@ -141,6 +141,39 @@ in the TODO-generation prompt so the main agent only needs to write
 the `todo_list.txt` file (no `Read` round-trip — that pattern caused
 duplicate Reads on weaker models).
 
+## When NOT to use `/brainstorm`
+
+`/brainstorm` is **pure-reasoning** — every persona only knows what
+their underlying model knew at training time. There are no tool
+calls during the debate (the personas all run with `no_tools=True`),
+so the panel can't pull live data, can't read files, can't search
+the web.
+
+That makes it a **poor fit** for any topic where a useful answer
+depends on **fresh facts**:
+
+| Don't use it for | Why |
+|---|---|
+| Stock picks ("which stocks will outperform in 2026?") | Personas hallucinate tickers and theses based on stale training data; no current prices, no recent earnings, no current news. The "concrete tickers" you get back are educated guesses dressed up as research. |
+| Current events ("who won the 2026 election?", "what happened to OpenAI last week?") | Same problem — the model doesn't know what happened after its training cutoff. |
+| Specific code in a repo it hasn't read | The persona doesn't see your code. It can debate refactor *philosophies* but not whether `function_x` should be inlined. |
+| Anything needing a number from a tool (latency benchmarks, file sizes, real test results) | No tool access during the debate. |
+
+**Better workflow for data-hungry topics:**
+1. `/research <topic>` — pulls 20-source brief with real citations.
+2. Read the brief.
+3. Then `/brainstorm <topic>` with the brief in context — the personas now reason against actual facts, not their training memory.
+
+`/brainstorm` IS a great fit for **pure-reasoning** topics:
+
+| Use it for | Why |
+|---|---|
+| Architecture decisions ("Postgres vs ClickHouse for our analytics?") | Trade-offs are well-covered in training data; multi-persona debate surfaces angles a single model glosses over. |
+| Refactor strategies ("how should we untangle the auth layer?") | Same — competing approaches and their failure modes are debatable from first principles. |
+| API / UX design tensions | Multi-perspective stress-test of design choices. |
+| Risk assessment of a planned change | Different personas (security, ops, product) each surface different risks. |
+| Strategy / roadmap ordering | Adversarial round forces you to defend why X before Y. |
+
 ## Tips
 
 - **Use `--lead <strong-model>` when personas are weak.** A qwen2.5

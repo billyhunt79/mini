@@ -57,6 +57,96 @@ def _parse_lead_flag(args: str) -> tuple[str | None, str]:
     return m.group(1), (args[:m.start()] + args[m.end():]).strip()
 
 
+_WEAK_LEAD_FAMILIES = (
+    "qwen", "qwq", "llama-3.2", "llama-3.1-8b", "llama-3.3-8b",
+    "gemma", "phi-3", "phi-4-mini", "mistral-7b", "kimi-7b",
+    "minimax-text", "abab", "deepseek-coder-6", "qwen2.5-coder-7",
+    "qwen2.5-7b", "qwen2-7b",
+)
+
+
+def _is_weak_lead_model(model_id: str) -> bool:
+    """Return True if `model_id` looks like a chat-tuned small / weak
+    family that historically struggles with the lead-moderator role
+    (running the opening + probes + synthesis adversarially).
+
+    Used only to print a one-time warning recommending a stronger model
+    via `--lead`. Never silently overrides the user's choice."""
+    if not model_id:
+        return False
+    tail = model_id.rsplit("/", 1)[-1].lower()
+    return any(fam in tail for fam in _WEAK_LEAD_FAMILIES)
+
+
+def _extract_challenge_blocks(text: str) -> list[str]:
+    """Pull the body of every `### [CHALLENGE → Agent X]` block out of a
+    persona's round-2+ response. Returns a list of normalised strings
+    (lower-cased, whitespace-collapsed, max 500 chars each) suitable for
+    similarity comparison. Empty list if no challenge blocks found."""
+    import re as _re_ch
+    if not text:
+        return []
+    # Match heading `### [CHALLENGE` (or with → arrow / minor spelling
+    # variation), capture body until next `###` heading or EOF.
+    pattern = _re_ch.compile(
+        r"###\s*\[?CHALLENGE.*?\](.*?)(?=###|\Z)",
+        _re_ch.DOTALL | _re_ch.IGNORECASE,
+    )
+    out: list[str] = []
+    for m in pattern.finditer(text):
+        body = m.group(1).strip()
+        # Normalise: lowercase, collapse whitespace, cap length
+        body_norm = _re_ch.sub(r"\s+", " ", body.lower())[:500]
+        if body_norm:
+            out.append(body_norm)
+    return out
+
+
+def _jaccard_similarity(a: str, b: str) -> float:
+    """Token-set Jaccard overlap of two strings. Cheap, language-agnostic
+    enough to catch the qwen2.5 copy-paste pattern (round 2+ personas
+    cloning another agent's CHALLENGE verbatim with maybe a word changed)."""
+    if not a or not b:
+        return 0.0
+    import re as _re_jac
+    # Tokenise on word boundaries; keeps Chinese as runs of CJK chars.
+    tok_a = set(_re_jac.findall(r"\w+", a))
+    tok_b = set(_re_jac.findall(r"\w+", b))
+    if not tok_a or not tok_b:
+        return 0.0
+    inter = len(tok_a & tok_b)
+    union = len(tok_a | tok_b)
+    return inter / union if union else 0.0
+
+
+def _is_redundant_challenge(new_text: str, prior_history: list[str],
+                              threshold: float = 0.7) -> tuple[bool, float]:
+    """Decide whether `new_text`'s CHALLENGE blocks duplicate any prior
+    one in `prior_history`. Returns (is_redundant, max_similarity).
+
+    `threshold` of 0.7 was picked empirically against the failure case
+    in `brainstorm_outputs/brainstorm_20260509_000935.md` where 8 of 10
+    round-2+ challenges were verbatim clones of the first one (Jaccard
+    > 0.95). 0.7 is lenient enough to allow legitimate "two agents
+    independently challenge the same claim with different angles".
+    """
+    new_blocks = _extract_challenge_blocks(new_text)
+    if not new_blocks:
+        return False, 0.0
+    prior_blocks: list[str] = []
+    for h in prior_history:
+        prior_blocks.extend(_extract_challenge_blocks(h))
+    if not prior_blocks:
+        return False, 0.0
+    max_sim = 0.0
+    for nb in new_blocks:
+        for pb in prior_blocks:
+            sim = _jaccard_similarity(nb, pb)
+            if sim > max_sim:
+                max_sim = sim
+    return max_sim >= threshold, max_sim
+
+
 def _llm_oneshot(model: str, system: str, user: str, config: dict, max_chunks: int = 4000) -> str:
     """Single-turn LLM call with no tools, returns concatenated text.
 
@@ -205,19 +295,33 @@ Do NOT explain your decision. Output exactly one of the two forms."""
 
 
 def _lead_synthesis(topic: str, transcript: str, lead_model: str,
-                    config: dict) -> str:
+                    config: dict, opening: str = "") -> str:
     """Lead produces the final structured synthesis. NO tool calls
     needed — the entire transcript is in the prompt context. This is
     what replaces the old "main agent reads file then synthesizes"
-    flow that caused the duplicate-Read bug."""
+    flow that caused the duplicate-Read bug.
+
+    `opening` is the lead's own debate-opening text (the agenda + ban
+    list it set at the start). When provided, the synthesis prompt
+    explicitly forces the lead to check its own action plan against
+    its own ban list — closing the failure case where the synthesis
+    listed "consult an advisor" as filler in the same document where
+    its action plan included "discuss with a financial advisor"."""
     sys = (
         "You are the LEAD MODERATOR producing the final synthesis. The "
-        "user will read THIS document and act on it. Filler is malpractice."
+        "user will read THIS document and act on it. Filler is malpractice. "
+        "You set the ban list yourself in the opening — DO NOT contradict "
+        "yourself by recommending what you forbid."
+    )
+    opening_block = (
+        f"YOUR OWN OPENING (the agenda + ban list YOU set at the start; "
+        f"every action you propose below must obey this):\n\n{opening}\n\n---\n\n"
+        if opening else ""
     )
     user = f"""TOPIC: {topic}
 
-FULL DEBATE TRANSCRIPT (each section is one expert's contribution,
-in the order they spoke):
+{opening_block}FULL DEBATE TRANSCRIPT (each section is one expert's
+contribution, in the order they spoke):
 
 {transcript}
 
@@ -244,6 +348,13 @@ action must have:
     output of that research.
   - An owner if applicable (you, the user, an advisor).
   - A binary done/not-done acceptance criterion.
+
+**SELF-CHECK BEFORE WRITING THIS SECTION**: re-read the ban list in
+your opening above. If any action you're about to write matches a
+banned escape hatch (e.g. "consult an advisor", "diversify",
+"monitor regularly", "research X" without naming what), REWRITE the
+action to be specific — or DELETE it. The contradiction of banning
+something then recommending it is unacceptable.
 
 ## What Was Filler
 1-3 bullets calling out the cheap escape hatches the experts tried
@@ -398,16 +509,36 @@ USER FOCUS: {user_topic}
         info(clr("(persona generation failed, using default tech personas)", "dim"))
         personas = dict(list(_TECH_PERSONAS.items())[:agent_count])
 
-    def get_identity(letter):
+    def _make_identity(letter: str) -> tuple[str, str]:
+        """Build (letter, name) for one persona. Faker is preferred but falls
+        back to a small hand-picked pool if the package is missing."""
         try:
             from faker import Faker
-            fake = Faker()
-            return f"{letter}", fake.name()
+            return letter, Faker().name()
         except Exception:
             import random
             first = ["Alex", "Sam", "Taylor", "Jordan", "Casey", "Riley", "Drew", "Avery"]
             last = ["Garcia", "Martinez", "Lopez", "Hernandez", "Gonzalez", "Sanchez", "Ramirez", "Torres"]
-            return f"{letter}", f"{random.choice(first)} {random.choice(last)}"
+            return letter, f"{random.choice(first)} {random.choice(last)}"
+
+    # Pre-assign a stable (letter, name) for each persona ONCE, by the
+    # persona's index in `personas`. Two prior bugs this kills:
+    #   (1) `persona_name[0].upper()` for letter — every persona key was
+    #       `p1/p2/…` so every Agent ended up labeled `P`, breaking the
+    #       cross-examination's clarity (`Agent P quoting Agent P attacking
+    #       Agent P`). Letters are now A, B, C, … (capped at Z if you ever
+    #       need >26 personas, which is extreme).
+    #   (2) `get_identity` was re-rolled every persona invocation, so the
+    #       SAME persona's "name" changed across rounds (round 1 = Riley
+    #       Torres, round 2 defense = Alex Lopez, round 3 = Taylor Gonzalez
+    #       — all the same agent). That made the transcript impossible to
+    #       follow. Identity is now sealed before the rounds loop.
+    _persona_keys = list(personas.keys())
+    _LETTERS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    persona_identity: dict[str, tuple[str, str]] = {
+        k: _make_identity(_LETTERS[i] if i < len(_LETTERS) else f"X{i+1}")
+        for i, k in enumerate(_persona_keys)
+    }
 
     outputs_dir = Path("brainstorm_outputs")
     outputs_dir.mkdir(exist_ok=True)
@@ -423,6 +554,23 @@ USER FOCUS: {user_topic}
         info(clr(f"Multi-model debate across: {', '.join(persona_models)}", "dim"))
     if lead_model != curr_model:
         info(clr(f"Lead moderator: {lead_model}", "dim"))
+
+    # Heads-up if the lead model is in a known weak family — the lead
+    # role (opening / probes / synthesis) carries most of the quality
+    # weight; a weak lead leaves the personas un-moderated and the
+    # synthesis flat. We never override silently — just inform.
+    if _is_weak_lead_model(lead_model):
+        warn(
+            f"  Lead model `{lead_model}` is a small/weak family — "
+            f"opening + probes + synthesis quality will suffer."
+        )
+        info(clr(
+            "  Tip: pass `--lead claude-opus-4-7` (or any strong model) "
+            "to keep weak personas but get a strong moderator. "
+            "Free option: `--lead nim/deepseek-ai/deepseek-r1` "
+            "(NIM free tier, no payment).",
+            "dim",
+        ))
 
     # ── Stage 1: Lead opening — set the agenda + reject filler. ──────────
     info(clr("Lead moderator framing the debate...", "dim"))
@@ -446,7 +594,9 @@ USER FOCUS: {user_topic}
     def call_persona(persona_name, p_data, history, persona_model: str,
                      anchor: str, round_num: int = 1, total_rounds: int = 1,
                      follow_up: str = ""):
-        letter, name = get_identity(persona_name[0].upper())
+        # Pull the pre-assigned, stable (letter, name) for this persona.
+        # Sealed once before the rounds loop — see persona_identity above.
+        letter, name = persona_identity[persona_name]
         anchor_block = (
             f"\nDEBATE ANCHOR (set by the lead moderator — adhere to this):\n{anchor}\n"
             if anchor else ""
@@ -584,7 +734,11 @@ INSTRUCTIONS:
         for i, (p_name, p_data) in enumerate(personas.items()):
             icon = p_data.get("icon", "🤖")
             p_model = _model_for_index(i)
-            letter = p_name[0].upper()
+            # Pull from the pre-assigned identity map (A, B, C, …) — see
+            # persona_identity build at the top of this function. Don't use
+            # `p_name[0].upper()` — every persona dict key is `p1/p2/…` so
+            # that always returns 'P'.
+            letter = persona_identity[p_name][0]
             label = (
                 f"{icon} {clr(p_data['role'], 'yellow')}"
                 + (f" ({clr(p_model, 'dim')})" if persona_models else "")
@@ -599,6 +753,55 @@ INSTRUCTIONS:
             if not content:
                 err(f"  └─ Failed to capture {p_name} perspective.")
                 continue
+
+            # Anti-copy-paste: in round 2+, weak models (qwen2.5 + vLLM
+            # is the canonical case) sometimes spot the first persona's
+            # CHALLENGE block in history and clone it verbatim with maybe
+            # one word changed. Detect Jaccard similarity ≥ 0.7 against
+            # any prior CHALLENGE block in the transcript and force ONE
+            # regeneration with an explicit "pick a different target /
+            # different angle" nudge. If it's still redundant after the
+            # retry, accept it but flag it in the log so the synthesizer
+            # can ignore it.
+            if round_num >= 2:
+                redundant, sim = _is_redundant_challenge(content, brainstorm_history)
+                if redundant:
+                    info(clr(
+                        f"  └─ Lead flag: {p_data['role']}'s challenge is "
+                        f"~{int(sim * 100)}% identical to a prior one — "
+                        f"asking for a different angle.",
+                        "yellow",
+                    ))
+                    nudge = (
+                        f"Your previous attempt copied another agent's "
+                        f"CHALLENGE block almost verbatim ({int(sim * 100)}% "
+                        f"token overlap). That doesn't add anything to the "
+                        f"debate. Pick a DIFFERENT target persona this time — "
+                        f"and a DIFFERENT angle of attack. Specifically: do "
+                        f"NOT challenge any of the same claims that were "
+                        f"already attacked above; find a fresh weakness in "
+                        f"someone else's contribution."
+                    )
+                    _start_tool_spinner()
+                    retry = call_persona(p_name, p_data, hist_text, p_model,
+                                          lead_opening, round_num=round_num,
+                                          total_rounds=n_rounds, follow_up=nudge)
+                    _stop_tool_spinner()
+                    # Use the retry only if it's actually less redundant.
+                    if retry:
+                        retry_redundant, retry_sim = _is_redundant_challenge(
+                            retry, brainstorm_history)
+                        if not retry_redundant or retry_sim < sim:
+                            content = retry
+                            print(clr("  └─ Re-engaged on a different angle.", "dim"))
+                        else:
+                            content = (
+                                f"_[lead note: contribution flagged as "
+                                f"redundant — {int(retry_sim * 100)}% overlap "
+                                f"with prior challenge]_\n\n{retry}"
+                            )
+                            print(clr("  └─ Still redundant — kept with flag.", "yellow"))
+
             brainstorm_history.append(content)
             heading_suffix = "" if round_num == 1 else f" — round {round_num}"
             full_log.append(f"## {icon} {p_data['role']}{heading_suffix} _(via {p_model})_\n{content}")
@@ -641,7 +844,10 @@ INSTRUCTIONS:
     # rather than slicing full_log by index — the index drifts every time
     # the header layout changes.
     transcript_for_synth = "\n\n".join(brainstorm_history)
-    lead_master_plan = _lead_synthesis(user_topic, transcript_for_synth, lead_model, config)
+    lead_master_plan = _lead_synthesis(
+        user_topic, transcript_for_synth, lead_model, config,
+        opening=lead_opening,
+    )
     _stop_tool_spinner()
     if lead_master_plan:
         full_log.append("---\n## 📋 Lead Synthesis — Master Plan\n" + lead_master_plan)
