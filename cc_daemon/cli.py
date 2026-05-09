@@ -153,6 +153,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
         config["log_level"] = "info"
     _bootstrap(config)
 
+    # F-2: ensure the daemon's SQLite tables exist before the listener
+    # starts publishing events / accepting jobs / writing monitor state.
+    # init_schema is idempotent so re-running on an existing DB is a no-op.
+    from . import schema as _schema
+    _schema.init_schema()
+
     # Pin the health.py module-level config so default-arg payload helpers
     # see the model name on every call.
     import health as _health
@@ -231,12 +237,34 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if audit_enabled:
         print(f"audit log: {data_dir / 'logs' / 'auth.jsonl'}", flush=True)
 
+    # F-3: take ownership of the monitor scheduler — only after the listener
+    # has bound, the pid/discovery files are on disk, and we've printed the
+    # ready banner.  Order matters: if a due subscription fires before the
+    # daemon is reachable, an LLM/network error in fetch/summarize/deliver
+    # would surface in the log before the user sees the listening line, and
+    # external clients couldn't yet act on the resulting `monitor_report`
+    # SSE event.  ``owned_by_daemon=True`` opts the loop out of the
+    # REPL-side step-aside check (otherwise the daemon would defer to its
+    # own discovery entry and never run a subscription).
+    try:
+        from monitor.scheduler import start as _monitor_start
+        _monitor_start(config, on_report=None, owned_by_daemon=True)
+    except Exception as exc:
+        print(f"warning: monitor scheduler did not start: {exc}",
+              file=sys.stderr, flush=True)
+
     # Graceful-shutdown watcher: when DaemonState.shutdown_event fires
-    # (set by system.shutdown RPC or the signal handler below), trigger
-    # server.shutdown() from a side thread (the spike's invariant: the
-    # same thread as serve_forever cannot call shutdown).
+    # (set by system.shutdown RPC or the signal handler below), stop
+    # the monitor scheduler and trigger server.shutdown() from a side
+    # thread (the spike's invariant: the same thread as serve_forever
+    # cannot call shutdown).
     def _watch_shutdown():
         server.daemon_state.shutdown_event.wait()
+        try:
+            from monitor.scheduler import stop as _monitor_stop
+            _monitor_stop()
+        except Exception:
+            pass
         threading.Thread(target=server.shutdown, daemon=True).start()
     threading.Thread(target=_watch_shutdown,
                       daemon=True, name="daemon-shutdown-watch").start()
