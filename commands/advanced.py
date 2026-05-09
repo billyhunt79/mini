@@ -240,12 +240,18 @@ INSTRUCTIONS:
     ok(f"Brainstorming complete! Results saved to {clr(str(out_file), 'bold')}")
 
     info(clr("Injecting debate results into current session for final analysis...", "dim"))
+    # Resolve to an absolute path before injecting into the model's prompt.
+    # Without this, the relative `brainstorm_outputs/<file>` makes the model
+    # invent an absolute prefix (e.g. it once expanded to a stale `PR/` path
+    # from an unrelated source tree) and Read fails. The system prompt also
+    # tells models to "always use absolute paths", so we owe them one.
+    out_file_abs = out_file.resolve()
     synthesis_prompt = f"""I have just completed a multi-agent brainstorming session regarding: '{user_topic}'.
-The full debate results have been saved to the file: {out_file}
+The full debate results have been saved to the file: {out_file_abs}
 
-Please read that file, then analyze the diverse perspectives. Identify the strongest ideas, potential conflicts, and provide a synthesized 'Master Plan' with concrete phases. Be concise and actionable."""
+Please read that file (use the absolute path above verbatim — do NOT prepend any directory), then analyze the diverse perspectives. Identify the strongest ideas, potential conflicts, and provide a synthesized 'Master Plan' with concrete phases. Be concise and actionable."""
 
-    return ("__brainstorm__", synthesis_prompt, str(out_file))
+    return ("__brainstorm__", synthesis_prompt, str(out_file_abs))
 
 
 def _save_synthesis(state, out_file: str) -> None:
