@@ -343,6 +343,30 @@ def _wx_poll_loop(token: str, base_url: str, config: dict) -> str:
                         pass
 
                 msg_id = msg.get("message_id") or msg.get("seq") or msg.get("client_id") or ""
+                # Fallback dedup signature when the API leaves all id-like
+                # fields empty: hash (from_uid, content, create_time).
+                # Without this the same message would re-dispatch every
+                # poll cycle until the API stops re-serving it.
+                if not msg_id:
+                    import hashlib as _h_dedup
+                    _content_preview = ""
+                    for _it in msg.get("item_list") or []:
+                        if _it.get("type") == _WX_ITEM_TEXT:
+                            _content_preview = (
+                                (_it.get("text_item") or {})
+                                .get("text", "")[:200]
+                            )
+                            break
+                    if not _content_preview:
+                        _content_preview = str(
+                            msg.get("content") or msg.get("text") or ""
+                        )[:200]
+                    _create_time = str(msg.get("create_time")
+                                        or msg.get("timestamp") or "")
+                    _dedup_seed = f"{from_uid}|{_create_time}|{_content_preview}"
+                    msg_id = "auto_" + _h_dedup.md5(
+                        _dedup_seed.encode("utf-8", "ignore"),
+                    ).hexdigest()[:16]
                 if msg_id and msg_id in _wx_seen_msgids:
                     continue
                 if msg_id:
@@ -661,9 +685,18 @@ def _wx_poll_loop(token: str, base_url: str, config: dict) -> str:
 
 def _dispatch_wx_job(job, q_text: str, uid: str,
                      run_query_cb, session_ctx, config: dict) -> None:
-    """Fire job in a background thread for this user, then drain their queue."""
+    """Fire job in a background thread for this user, then drain their queue.
+
+    IMPORTANT: ``_wx_busy[uid]`` is set ``True`` SYNCHRONOUSLY before the
+    thread starts. Otherwise a race window exists between
+    ``_dispatch_wx_job`` returning and the thread setting the flag, during
+    which a follow-up poll-cycle message would see ``_wx_busy=False`` and
+    spawn a second concurrent runner for the same user (observed in the
+    field as one inbound message producing 2-3 ``任务 #xxx 执行中`` lines).
+    """
+    _wx_busy[uid] = True
+
     def _run():
-        _wx_busy[uid] = True
         try:
             _wx_bg_runner(job, q_text, uid, run_query_cb, session_ctx, config)
         finally:
