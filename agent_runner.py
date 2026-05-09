@@ -246,6 +246,28 @@ class AgentRunner:
         )
 
         iteration = 0
+        # Consecutive-failure tracking — stop the agent if N iterations
+        # in a row hit the same kind of error, so a fundamentally broken
+        # request (context overflow that compaction can't fix, missing
+        # API key, unauthorized model, etc.) doesn't loop for hours.
+        # See _SAME_ERROR_STOP_LIMIT below for the threshold.
+        consecutive_failures = 0
+        last_failure_signature: str | None = None
+        _SAME_ERROR_STOP_LIMIT = 3
+        # Circuit-breaker awareness — when an iteration's text contains
+        # the standard "[Circuit breaker OPEN ... Cooldown: Xs]" marker,
+        # honor that cooldown instead of the configured 2s interval.
+        # Otherwise we burn 60+ wasted iterations per single 120s cooldown.
+        import re as _re_runner
+        _CIRCUIT_RE = _re_runner.compile(
+            r"Circuit breaker OPEN.*?Cooldown:\s*(\d+(?:\.\d+)?)\s*s",
+            _re_runner.IGNORECASE,
+        )
+        _FAILURE_RE = _re_runner.compile(
+            r"\[(?:Failed|Circuit breaker)\b[^\]]*\]",
+            _re_runner.IGNORECASE,
+        )
+
         while not self._stop_event.is_set():
             iteration += 1
             self.iteration = iteration
@@ -330,8 +352,62 @@ class AgentRunner:
             _log.info("agent_runner_iter", name=self.name, iteration=iteration,
                       status=rec_status, duration_s=rec.duration_s)
 
+            # ── Consecutive-failure tracking ────────────────────────────
+            # An iteration "fails" if the catch above marked it error OR
+            # if the streamed text contains a `[Failed ...]` / `[Circuit
+            # breaker ...]` marker (agent.py emits these in its retry
+            # loop when retries are exhausted or the breaker is open).
+            full_text = "".join(text_chunks)
+            failure_match = _FAILURE_RE.search(full_text)
+            failed_this_iter = (rec_status == "error" or bool(failure_match))
+            if failed_this_iter:
+                # Build a short signature so "same error 3x in a row" is
+                # robust against tiny phrasing differences (timestamps,
+                # session IDs).
+                sig = (failure_match.group(0) if failure_match else err_msg)[:80]
+                if sig == last_failure_signature:
+                    consecutive_failures += 1
+                else:
+                    last_failure_signature = sig
+                    consecutive_failures = 1
+                if consecutive_failures >= _SAME_ERROR_STOP_LIMIT:
+                    self._notify(
+                        f"⏹ [{self.name}] stopping — {consecutive_failures} "
+                        f"consecutive iterations failed with the same error.\n"
+                        f"Signature: `{sig}`\n\n"
+                        f"This is usually one of: a fundamentally broken "
+                        f"request (context too big to compact), an exhausted "
+                        f"API key / quota, or an upstream model that's down. "
+                        f"Inspect the log: `/agent log {self.name}`"
+                    )
+                    _log.warn("agent_runner_consecutive_failure_stop",
+                              name=self.name, iterations=iteration,
+                              consecutive=consecutive_failures,
+                              signature=sig)
+                    self._stop_event.set()
+                    break
+            else:
+                consecutive_failures = 0
+                last_failure_signature = None
+
+            # ── Circuit-breaker cooldown override ───────────────────────
+            # When the iteration's output mentions a circuit-breaker
+            # cooldown, sleep that long (capped at 5 min) instead of
+            # the configured 2s interval. Avoids 60+ pointless retries
+            # against an upstream that's already telling us "wait".
+            wait_s = self.interval
+            cb_match = _CIRCUIT_RE.search(full_text)
+            if cb_match:
+                try:
+                    cooldown = float(cb_match.group(1))
+                    wait_s = max(self.interval, min(cooldown + 1.0, 300.0))
+                    _log.info("agent_runner_circuit_wait",
+                              name=self.name, cooldown_s=wait_s)
+                except ValueError:
+                    pass
+
             # Wait before next iteration (stop event wakes it early)
-            self._stop_event.wait(self.interval)
+            self._stop_event.wait(wait_s)
 
         self.status = "stopped"
         self._notify(f"⏹ Agent **{self.name}** stopped after {iteration} iterations.")

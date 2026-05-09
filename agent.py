@@ -163,6 +163,11 @@ def run(
         _nim_fallbacks_used = 0
         _NIM_FALLBACK_LIMIT = 3
 
+        # Bounded to ONE per turn so a genuine overflow (prompt itself
+        # too big) eventually surfaces instead of looping. See
+        # `_try_reduce_output_cap_from_error` for the parser.
+        _output_cap_reduced_this_turn = False
+
         # Stream from provider — retry on ANY error (never crash the session)
         max_retries = 3
         for attempt in range(max_retries + 1):
@@ -230,6 +235,32 @@ def run(
                     break
 
                 if cerr.should_compress:
+                    # Before compacting, try to PARSE the error message
+                    # for explicit token counts. Many providers return:
+                    #   "max context 32768. requested 8192 output tokens
+                    #    and your prompt contains 24577 input tokens..."
+                    # When the prompt itself fits but `requested_output`
+                    # pushes total over the limit, we can fix this by
+                    # lowering max_tokens — no compaction needed (it
+                    # wouldn't help anyway when the user's input is the
+                    # huge thing, e.g. a PDF read).
+                    # Bounded to ONE auto-reduction per turn so a true
+                    # overflow eventually surfaces.
+                    if not _output_cap_reduced_this_turn:
+                        new_cap = _try_reduce_output_cap_from_error(str(e), config)
+                        if new_cap and new_cap >= 256:
+                            _output_cap_reduced_this_turn = True
+                            old_cap = config.get("max_tokens")
+                            config = {**config, "max_tokens": new_cap}
+                            _log.info("output_cap_auto_reduced",
+                                       session_id=session_id,
+                                       from_cap=old_cap, to_cap=new_cap)
+                            yield TextChunk(
+                                f"\n[Context overflow — reducing output cap "
+                                f"{old_cap}→{new_cap} and retrying (attempt "
+                                f"{attempt+1}/{max_retries})]\n"
+                            )
+                            continue
                     _force_compact(state, config)
                     yield TextChunk(f"\n[Context too long — compacted and retrying (attempt {attempt+1}/{max_retries})]\n")
                     continue
@@ -575,6 +606,57 @@ def _truncate_err(s: str, max_len: int = 120) -> str:
     if len(s) <= max_len:
         return s
     return s[:max_len - 3] + "..."
+
+
+def _try_reduce_output_cap_from_error(error_str: str, config: dict) -> int | None:
+    """Parse an OpenAI-style context-overflow error and compute a safe
+    new max_tokens cap that fits within the model's window.
+
+    Most providers return the message in this shape:
+
+        "This model's maximum context length is 32768 tokens. However,
+         you requested 8192 output tokens and your prompt contains at
+         least 24577 input tokens, for a total of 32769 tokens..."
+
+    From those numbers we can compute the largest output cap that fits:
+        new_cap = model_max - prompt_tokens - SAFETY_BUFFER
+
+    Returns:
+        Suggested new max_tokens (>=1), or None if numbers couldn't be
+        parsed or the new cap would be too small (<256) to be useful —
+        in which case the caller falls back to compaction.
+    """
+    if not error_str:
+        return None
+    import re as _re_cap
+    # Three numbers, in order: max-context, requested-output, prompt-tokens.
+    # All providers we've seen use these patterns; tolerant on phrasing.
+    m_max = _re_cap.search(
+        r"(?:maximum\s+context\s+length|context\s+window|max(?:imum)?\s+tokens)\s+"
+        r"(?:is\s+|of\s+)?(\d+)",
+        error_str, _re_cap.IGNORECASE,
+    )
+    m_prompt = _re_cap.search(
+        r"prompt\s+contains\s+(?:at\s+least\s+)?(\d+)",
+        error_str, _re_cap.IGNORECASE,
+    )
+    if not (m_max and m_prompt):
+        return None
+    try:
+        model_max = int(m_max.group(1))
+        prompt_tokens = int(m_prompt.group(1))
+    except ValueError:
+        return None
+    SAFETY_BUFFER = 200
+    new_cap = model_max - prompt_tokens - SAFETY_BUFFER
+    # Don't return a cap that's even smaller than what's currently set
+    # — that would be a no-op or a regression.
+    current_cap = config.get("max_tokens") or 0
+    if current_cap and new_cap >= current_cap:
+        return None
+    if new_cap < 256:
+        return None
+    return new_cap
 
 
 # Matches an absolute-path-like token: starts with '/', has at least two
