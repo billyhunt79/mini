@@ -207,12 +207,16 @@ def _resolve_git_binary() -> str | None:
 
 
 def git_handler(args: dict, ctx: ToolContext) -> dict:
+    # Validation order: cheap argv-shape checks first (fail-fast on
+    # malformed input), expensive disk check last. Ensures a malformed
+    # ref/path/args/timeout produces a clear ``invalid_args`` error
+    # without requiring the repo to exist on disk yet.
     op        = _validate_op(args.get("op"))
-    repo      = _validate_repo(args.get("repo"))
     ref       = _validate_ref(args.get("ref"))
-    path_arg  = _validate_path(args.get("path"), repo)
+    path_arg  = _validate_path(args.get("path"), repo=None)
     extra     = _validate_args(args.get("args"), op)
     timeout_s = _validate_timeout(args.get("timeout_s"))
+    repo      = _validate_repo(args.get("repo"))
 
     git_bin = _resolve_git_binary()
     if git_bin is None:
