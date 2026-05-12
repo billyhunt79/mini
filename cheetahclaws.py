@@ -107,6 +107,8 @@ Slash commands in REPL:
   /telegram stop|status             Stop or check Telegram bridge
   /wechat login                     Authenticate WeChat via QR code
   /wechat stop|status               Stop or check WeChat bridge
+  /qq <appid> <secret>              Start QQ bridge (QQ Bot)
+  /qq stop|status                   Stop or check QQ bridge
   /slack <token> <channel_id>       Start Slack bridge (Web API)
   /slack stop|status|logout         Stop, check, or clear Slack bridge
   /lab start <topic>                Autonomous multi-agent research run (9 stages)
@@ -214,9 +216,11 @@ HAS_PROMPT_TOOLKIT = _ui_input.HAS_PROMPT_TOOLKIT
 import bridges.telegram as _btg
 import bridges.wechat   as _bwx
 import bridges.slack    as _bslk
+import bridges.qq       as _bqq
 from bridges.telegram import cmd_telegram, _tg_send
 from bridges.wechat   import cmd_wechat, _wx_start_bridge
 from bridges.slack    import cmd_slack, _slack_start_bridge
+from bridges.qq       import cmd_qq, _qq_start_bridge, _qq_send
 
 # ── Session commands ───────────────────────────────────────────────────────
 from commands.session import (
@@ -265,6 +269,7 @@ from tools import (
     _tg_thread_local, _is_in_tg_turn,
     _wx_thread_local, _is_in_wx_turn,
     _slack_thread_local, _is_in_slack_turn,
+    _qq_thread_local, _is_in_qq_turn,
 )
 
 # ── Live session context (replaces config["_run_query_callback"] etc.) ─────
@@ -417,6 +422,7 @@ COMMANDS = {
     "wechat":      cmd_wechat,
     "weixin":      cmd_wechat,
     "slack":       cmd_slack,
+    "qq":          cmd_qq,
     "checkpoint":  cmd_checkpoint,
     "rewind":      cmd_rewind,
     "plan":        cmd_plan,
@@ -582,6 +588,7 @@ _CMD_META: dict[str, tuple[str, list[str]]] = {
     "telegram":    ("Telegram bot bridge",                ["stop", "status"]),
     "wechat":      ("WeChat bridge (iLink Bot API)",      ["stop", "status"]),
     "slack":       ("Slack bot bridge (Web API)",         ["stop", "status", "logout"]),
+    "qq":          ("QQ bot bridge (botpy SDK)",          ["<appid> <secret>", "stop", "status"]),
     **({"video": ("AI video factory: story→voice→images→mp4", ["status", "niches"])} if _VIDEO_AVAILABLE else {}),
     "checkpoint":  ("List / restore checkpoints",          ["clear"]),
     "rewind":      ("Rewind to checkpoint (alias)",        ["clear"]),
@@ -726,7 +733,7 @@ def _make_bridge_slash_handler(state, config, run_query):
 
 
 def _start_headless_bridges(config: dict) -> None:
-    """Auto-start configured Telegram/WeChat/Slack bridges in headless mode.
+    """Auto-start configured Telegram/WeChat/Slack/QQ bridges in headless mode.
 
     Sets up a shared ``session_ctx`` with a minimal ``run_query`` driving the
     agent loop directly (no REPL UI). Bridges keep their existing event
@@ -735,7 +742,8 @@ def _start_headless_bridges(config: dict) -> None:
     """
     if not (config.get("telegram_token") and config.get("telegram_chat_id")) \
             and not config.get("wechat_token") \
-            and not (config.get("slack_token") and config.get("slack_channel")):
+            and not (config.get("slack_token") and config.get("slack_channel")) \
+            and not (config.get("qq_appid") and config.get("qq_secret")):
         return  # nothing configured — no-op
 
     import runtime as _runtime
@@ -797,6 +805,10 @@ def _start_headless_bridges(config: dict) -> None:
         state, config, _headless_run_query
     )
 
+    # Pre-set QQ send callback so permission prompts work before the poll loop sets it.
+    if config.get("qq_appid") and config.get("qq_secret"):
+        session_ctx.qq_send = lambda tid, text: _qq_send(tid, text, config)
+
     if config.get("telegram_token") and config.get("telegram_chat_id"):
         if not (_btg._telegram_thread and _btg._telegram_thread.is_alive()):
             _btg._telegram_stop.clear()
@@ -814,6 +826,10 @@ def _start_headless_bridges(config: dict) -> None:
     if config.get("slack_token") and config.get("slack_channel"):
         if not (_bslk._slack_thread and _bslk._slack_thread.is_alive()):
             _slack_start_bridge(config)
+
+    if config.get("qq_appid") and config.get("qq_secret"):
+        if not (_bqq._qq_thread and _bqq._qq_thread.is_alive()):
+            _qq_start_bridge(config)
 
 
 # ── Main REPL ──────────────────────────────────────────────────────────────
@@ -967,6 +983,8 @@ def repl(config: dict, initial_prompt: str = None):
             active_flags.append("wechat")
         if config.get("slack_token") and config.get("slack_channel"):
             active_flags.append("slack")
+        if config.get("qq_appid") and config.get("qq_secret"):
+            active_flags.append("qq")
         if active_flags:
             flags_str = " · ".join(clr(f, "green") for f in active_flags)
             info(f"Active: {flags_str}")
@@ -1004,10 +1022,12 @@ def repl(config: dict, initial_prompt: str = None):
             # Rebuild system prompt each turn (picks up cwd changes, etc.)
             system_prompt = build_system_prompt(config)
 
-            if is_background and not session_ctx.telegram_incoming:
+            if is_background and not (session_ctx.telegram_incoming or session_ctx.qq_incoming):
                 print(clr("\n\n[Background Event Triggered]", "yellow"))
             session_ctx.in_telegram_turn = session_ctx.telegram_incoming
             session_ctx.telegram_incoming = False
+            session_ctx.in_qq_turn = session_ctx.qq_incoming
+            session_ctx.qq_incoming = False
 
             print(clr("\n╭─ CheetahClaws ", "dim") + clr("●", "green") + clr(" ─────────────────────────", "dim"))
 
@@ -1212,6 +1232,11 @@ def repl(config: dict, initial_prompt: str = None):
     if config.get("slack_token") and config.get("slack_channel"):
         if not (_bslk._slack_thread and _bslk._slack_thread.is_alive()):
             _slack_start_bridge(config)
+
+    # ── Auto-start QQ bridge if configured ────────────────────────────
+    if config.get("qq_appid") and config.get("qq_secret"):
+        if not (_bqq._qq_thread and _bqq._qq_thread.is_alive()):
+            _qq_start_bridge(config)
 
     # ── Rapid Ctrl+C force-quit ─────────────────────────────────────────
     # 3 Ctrl+C presses within 2 seconds → immediate hard exit
